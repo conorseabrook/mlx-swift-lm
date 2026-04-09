@@ -160,20 +160,8 @@ private class RMSNormNoScale: Module {
     }
 }
 
-private class ScaledLinear: Module {
-    let weight: MLXArray
-    let scalar: Float
-
-    init(inFeatures: Int, outFeatures: Int, scalar: Float) {
-        self.weight = MLXArray.zeros([outFeatures, inFeatures])
-        self.scalar = scalar
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x, weight.T) * scalar
-    }
-}
+// ScaledLinear was removed — MLX quantization only auto-dequantizes Linear layers.
+// The per_layer_model_projection scalar is applied inline in the forward pass instead.
 
 // MARK: - Attention
 
@@ -462,8 +450,11 @@ private class Gemma4TextModelInner: Module {
 
     // Per-layer embeddings (PLE)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: Linear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
+
+    // Scalar for per-layer model projection, applied inline since Linear supports quantization
+    let perLayerModelProjectionScalar: Float
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
     let previousKvs: [Int]
@@ -486,12 +477,15 @@ private class Gemma4TextModelInner: Module {
             self._embedTokensPerLayer.wrappedValue = Embedding(
                 embeddingCount: config.vocabSizePerLayerInput,
                 dimensions: config.numHiddenLayers * config.hiddenSizePerLayerInput)
-            self._perLayerModelProjection.wrappedValue = ScaledLinear(
-                inFeatures: config.hiddenSize,
-                outFeatures: config.numHiddenLayers * config.hiddenSizePerLayerInput,
-                scalar: pow(Float(config.hiddenSize), -0.5))
+            self._perLayerModelProjection.wrappedValue = Linear(
+                config.hiddenSize,
+                config.numHiddenLayers * config.hiddenSizePerLayerInput,
+                bias: false)
+            self.perLayerModelProjectionScalar = pow(Float(config.hiddenSize), -0.5)
             self._perLayerProjectionNorm.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSizePerLayerInput, eps: config.rmsNormEps)
+        } else {
+            self.perLayerModelProjectionScalar = 1.0
         }
 
         // Build KV-sharing map
@@ -539,8 +533,8 @@ private class Gemma4TextModelInner: Module {
                 tokenPLE.dim(0), tokenPLE.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
 
-            // Model projection PLE
-            let modelPLE = modelProj(h).reshaped(
+            // Model projection PLE (scalar applied inline for quantization compatibility)
+            let modelPLE = (modelProj(h) * perLayerModelProjectionScalar).reshaped(
                 h.dim(0), h.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
             let normedModelPLE = projNorm(modelPLE)
